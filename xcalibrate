@@ -2,13 +2,36 @@
 
 # requires python3-tk, python3-numpy
 
+import sys
+import os, os.path
+import argparse
 import re
 import numpy as np
 from subprocess import run, PIPE
 
+parser = argparse.ArgumentParser(description="Xcalibrate")
+parser.add_argument("-n","--no-walkthrough",action="store_true", help="Disables the walkthrough. Chooses appropriate defaults where none are supplied")
+parser.add_argument("-l","--list",action="store_true", help="Lists available calibratable devices, then exits")
+parser.add_argument("-c","--calibrate",action="store_true", help="Calibrates the device")
+parser.add_argument("-s","--skip-test",action="store_true", help="Skips the test")
+parser.add_argument("-t","--test",action="store_true", help="Runs the test without prompting the user")
+parser.add_argument("-r","--rotation",action="store_true", help="Allows the transformation matrix to include rotations")
+parser.add_argument("-M", "--maximize",action="store_true", help="If the calibration screen isn't full screen, this flag may fix it")
+parser.add_argument("-u", "--update",action="store_true", help="Applies the transformation matrix to the chosen device. (Only works with --calibrate, or with the walkthrough)")
+parser.add_argument("-p","--points",action="store",type=int, help="Specifies the number of points to use when calibrating the device (minimum of 3, default of 4)")
+parser.add_argument("-T","--test-points",action="store",type=int, help="Specifies the number of points to use when testing the device (minimum of 3, default of 4)")
+parser.add_argument("-d","--device",action="store",type=int, help="Specifies the device to calibrate as an integer (see --list)")
+parser.add_argument("-S","--save-file",action="store",type=str, help="Saves the transformation matrix to the given configuration file")
+args = parser.parse_args()
 
 prop_name = 'libinput Calibration Matrix'
-
+configFormat = (
+    'Section "InputClass"\n'
+    '    Identifier      "calibration"\n'
+    '    MatchProduct    "{}"\n'
+    '    Option          "CalibrationMatrix"  "{}"\n'
+    'EndSection\n'
+)
 
 def xinput(*args):
     return run(args=('/usr/bin/xinput', *args),
@@ -22,7 +45,7 @@ def get_devs():
     if not devs:
         print('No suitable input devices found')
         exit(1)
-    return devs
+    return dict(filter(lambda e: validate_dev(devs, e[0]), devs.items()))
 
 
 def print_devs(devs):
@@ -32,13 +55,20 @@ def print_devs(devs):
         print('%4d %35s' % (i, name))
     print()
 
-
 def choose_preferred(devs):
     preferred = [i for (i, n) in devs.items() if 'touch' in n.lower()]
     if preferred:
         return preferred[0]
     return next(iter(devs.keys()))
 
+def validate_dev(devs, dev):
+    if not dev in devs.keys():
+        return False
+    stdout = xinput('--list-props', str(dev))
+    line = re.search(prop_name + r'.*:\s+(\S.+)', stdout)
+    if not line:
+        return False
+    return True
 
 def choose_dev(devs, preferred):
     while True:
@@ -49,7 +79,7 @@ def choose_dev(devs, preferred):
             dev = int(devstr)
         except ValueError:
             continue
-        if dev in devs.keys():
+        if validate_dev(devs, dev):
             return dev
 
 
@@ -104,8 +134,9 @@ def show_tk(n_points, old_cal_inv, new_cal=None):
     root.attributes('-fullscreen', True)
     # as the above line doesn't work on all screens
     # we force the geometry to be the fullsize with next two lines
-    w,h = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry("%dx%d" % (w,h))
+    if args.maximize:
+        w,h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry("%dx%d" % (w,h))
     canvas = Canvas(root)
 
     def resize(event):
@@ -254,32 +285,66 @@ def use_cal(dev, new_cal):
 def print_xorg_config(dev_name, new_cal):
     print("Create a file (for example 99-libinput-ts-calib.conf) in /usr/share/X11/xorg.conf.d/ and put in the following")
     print()
-    xorg_config = (
-    'Section "InputClass"\n'
-    '    Identifier      "calibration"\n'
-    '    MatchProduct    "{}"\n'
-    '    Option          "CalibrationMatrix"  "{}"\n'
-    'EndSection\n'
-    ).format(
+    xorg_config = configFormat.format(
         str(dev_name),
         " ".join(map(str, new_cal.flatten().tolist()[0]))
     )
     print(xorg_config)
 
+
 def main():
+    if args.skip_test and args.test:
+        print("can't skip and not skip test.")
+        parser.print_help()
+        exit(0)
+    if args.points is not None and args.points < 3:
+        print("invalid number of configuration points. Must have at least 3 points.")
+        parser.print_help()
+        exit(0)
+    if args.test_points is not None and args.test_points < 3:
+        print("invalid number of testing points. Must have at least 3 points.")
+        parser.print_help()
+        exit(0)
+
     devs = get_devs()
-    print_devs(devs)
+    if args.device is not None and not validate_dev(devs,args.device):
+        print("not a valid device. use --list to see devices.")
+        parser.print_help()
+        exit(0)
+    if args.list:
+        print_devs(devs)
+        exit(0)
+    if not args.no_walkthrough and args.device is None:
+        print_devs(devs)
+
     preferred = choose_preferred(devs)
-    dev = choose_dev(devs, preferred)
-    print()
+
+    dev = None
+    if args.no_walkthrough and args.device is None:
+        dev = preferred
+    elif args.device is not None:
+        dev = args.device
+    else:
+        dev = choose_dev(devs, preferred)
+        print()
 
     old_cal, old_cal_inv = read_cal(dev)
 
     new_cal = None
-    if ask('Calibrate?'):
-        n_points = choose_points()
-        disable_rot = ask('Disable rotation?')
-        print()
+    shouldCalibrate = args.calibrate
+    if not args.no_walkthrough and not shouldCalibrate:
+        shouldCalibrate = ask('Calibrate?')
+
+    if shouldCalibrate:
+        n_points = args.points
+        if not args.no_walkthrough and args.points is not None:
+            n_points = choose_points()
+        elif args.points is None:
+            n_points = 4
+        disable_rot = not args.rotation
+        if not args.no_walkthrough and disable_rot:
+            disable_rot = ask('Disable rotation?')
+            print()
 
         points = show_tk(n_points, old_cal_inv)
         if points:
@@ -290,12 +355,39 @@ def main():
             print('Quality (should be at least 3): %.1f' % quality)
             print()
 
-    if ask('Test?'):
-        n_points = choose_points()
-        show_tk(n_points, old_cal_inv, new_cal)
+    test = args.test
+    if not args.no_walkthrough and not args.skip_test and not args.test:
+        test = ask('Test?')
+    if test:
+        n_points = args.test_points
+        if not args.no_walkthrough and args.test_points is not None:
+            n_points = choose_points()
+        elif args.test_points is None:
+            n_points = 4
+        points = show_tk(n_points, old_cal_inv, new_cal)
+        if points:
+            _, quality = calibrate(points, disable_rot)
 
-    if new_cal is not None and ask('Use calibration?'):
+            print('Quality (should be at least 3): %.1f' % quality)
+            print()
+
+    useCalibration = args.update and new_cal is not None
+    if not args.no_walkthrough and not args.update and new_cal is not None:
+        useCalibration = ask('Use calibration?')
+    if useCalibration:
         use_cal(dev, new_cal)
         print_xorg_config(devs[dev], new_cal)	
+    if args.save_file is not None:
+        i = args.save_file.rindex("/")
+        folder = args.save_file[:i]
+        fileName = args.save_file[i+1:]
+        if not os.path.exists(folder):
+            os.mkdir(folder)
+        with open(args.save_file, "w+") as f:
+            xorg_config = configFormat.format(
+                str(devs[dev]),
+                " ".join(map(str, new_cal.flatten().tolist()[0]))
+            )
+            f.write(xorg_config)
 
 main()
